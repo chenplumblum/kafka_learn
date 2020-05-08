@@ -58,6 +58,7 @@ public class DefaultPartitioner implements Partitioner {
         List<PartitionInfo> partitions = cluster.partitionsForTopic(topic);
         int numPartitions = partitions.size();
         // hash the keyBytes to choose a partition
+        // 有 key 的情况下,使用 key 的 hash 值进行计算
         return Utils.toPositive(Utils.murmur2(keyBytes)) % numPartitions;
     }
 

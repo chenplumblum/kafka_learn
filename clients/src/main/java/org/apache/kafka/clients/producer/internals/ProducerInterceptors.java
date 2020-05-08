@@ -54,10 +54,13 @@ public class ProducerInterceptors<K, V> implements Closeable {
      * @param record the record from client
      * @return producer record to send to topic/partition
      */
+    //使用ProducerInterceptor拦截器
     public ProducerRecord<K, V> onSend(ProducerRecord<K, V> record) {
         ProducerRecord<K, V> interceptRecord = record;
+        //为啥这个是一个数组拦截器去进行发送呢
         for (ProducerInterceptor<K, V> interceptor : this.interceptors) {
             try {
+                //实际就是每个拦截器链new一个新的ProducerRecord
                 interceptRecord = interceptor.onSend(interceptRecord);
             } catch (Exception e) {
                 // do not propagate interceptor exception, log and continue calling other interceptors
