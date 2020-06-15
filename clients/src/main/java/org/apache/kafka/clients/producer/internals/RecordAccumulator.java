@@ -169,8 +169,10 @@ public final class RecordAccumulator {
 
     /**
      * Add a record to the accumulator, return the append result
+     * 向累加器添加记录，返回追加结果
      * <p>
      * The append result will contain the future metadata, and flag for whether the appended batch is full or a new batch is created
+     * 追加结果将包含将来的元数据，并标记追加的批是否已满或是否创建了新批
      * <p>
      *
      * @param tp The topic/partition to which this record is being sent
@@ -200,11 +202,15 @@ public final class RecordAccumulator {
         if (headers == null) headers = Record.EMPTY_HEADERS;
         try {
             // check if we have an in-progress batch
+            // 根据Topic和Partition 找到或者创建一个对应 queue
+            //双端队列 Deque 实际上就是 ArrayDeque，非线程安全的，需要手动同步。使用双端队列可以在消息发送失败时，把消息直接放回队列头部进行重试。
             Deque<ProducerBatch> dq = getOrCreateDeque(tp);
             synchronized (dq) {
                 if (closed)
                     throw new KafkaException("Producer closed while send in progress");
+                //尝试将消息加入到队列尾部
                 RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callback, dq, nowMs);
+                // 加入成功则直接返回：失败则因为数据的空间不足：则开始将数据落盘，并清理队列
                 if (appendResult != null)
                     return appendResult;
             }
@@ -214,8 +220,9 @@ public final class RecordAccumulator {
                 // Return a result that will cause another call to append.
                 return new RecordAppendResult(null, false, false, true);
             }
-
+            //最大可用魔法
             byte maxUsableMagic = apiVersions.maxUsableProduceMagic();
+            // 估计消息最大的容量的大小。
             int size = Math.max(this.batchSize, AbstractRecords.estimateSizeInBytesUpperBound(maxUsableMagic, compression, key, value, headers));
             log.trace("Allocating a new {} byte message buffer for topic {} partition {}", size, tp.topic(), tp.partition());
             buffer = free.allocate(size, maxTimeToBlock);
@@ -226,18 +233,18 @@ public final class RecordAccumulator {
                 // Need to check if producer is closed again after grabbing the dequeue lock.
                 if (closed)
                     throw new KafkaException("Producer closed while send in progress");
-
+                //尝试将ProducerBatch加入到队列中
                 RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callback, dq, nowMs);
                 if (appendResult != null) {
                     // Somebody else found us a batch, return the one we waited for! Hopefully this doesn't happen often...
                     return appendResult;
                 }
-
+                //// 构造出压缩后的批量消息对象
                 MemoryRecordsBuilder recordsBuilder = recordsBuilder(buffer, maxUsableMagic);
                 ProducerBatch batch = new ProducerBatch(tp, recordsBuilder, nowMs);
                 FutureRecordMetadata future = Objects.requireNonNull(batch.tryAppend(timestamp, key, value, headers,
                         callback, nowMs));
-
+                // 加入双端队列
                 dq.addLast(batch);
                 incomplete.add(batch);
 

@@ -58,23 +58,27 @@ import static org.apache.kafka.common.record.RecordBatch.NO_PARTITION_LEADER_EPO
  * is removed from the metadata refresh set after an update. Consumers disable topic expiry since they explicitly
  * manage topics while producers rely on topic expiry to limit the refresh set.
  */
+// 这个类被 client 线程和后台 sender 所共享,它只保存了所有 topic 的部分数据,当我们请求一个它上面没有的 topic meta 时,它会通过发送 metadata update 来更新 meta 信息,
+// 如果 topic meta 过期策略是允许的,那么任何 topic 过期的话都会被从集合中移除,
+// 但是 consumer 是不允许 topic 过期的因为它明确地知道它需要管理哪些 topic
 public class Metadata implements Closeable {
     private final Logger log;
-    private final long refreshBackoffMs;
-    private final long metadataExpireMs;
+    private final long refreshBackoffMs;// metadata 更新失败时,为避免频繁更新 meta,最小的间隔时间,默认 100ms
+    private final long metadataExpireMs;// metadata 的过期时间, 默认 60,000ms
     private int updateVersion;  // bumped on every metadata response
     private int requestVersion; // bumped on every new topic addition
-    private long lastRefreshMs;
-    private long lastSuccessfulRefreshMs;
+    private long lastRefreshMs;// 最近一次更新时的时间（包含更新失败的情况）
+    private long lastSuccessfulRefreshMs;// 最近一次成功更新的时间（如果每次都成功的话，与前面的值相等, 否则，lastSuccessulRefreshMs < lastRefreshMs)
     private KafkaException fatalException;
     private Set<String> invalidTopics;
     private Set<String> unauthorizedTopics;
     private MetadataCache cache = MetadataCache.empty();
     private boolean needFullUpdate;
     private boolean needPartialUpdate;
-    private final ClusterResourceListeners clusterResourceListeners;
+    private final ClusterResourceListeners clusterResourceListeners;//当接收到 metadata 更新时, ClusterResourceListeners的列表
     private boolean isClosed;
     private final Map<TopicPartition, Integer> lastSeenLeaderEpochs;
+
 
     /**
      * Create a new Metadata instance

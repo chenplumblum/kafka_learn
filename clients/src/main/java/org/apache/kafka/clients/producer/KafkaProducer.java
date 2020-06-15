@@ -537,7 +537,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         }
         return config.getInt(ProducerConfig.RETRIES_CONFIG);
     }
-
+    //KafkaProducer 如果要使用幂等性，需要将 enable.idempotence 配置项设置为true。并且它对单个分区的发送，一次性最多发送5条。通过KafkaProducer的 configureInflightRequests 方法，可以看到对max.in.flight.requests.per.connection的限制。
     private static int configureInflightRequests(ProducerConfig config) {
         if (config.idempotenceEnabled() && 5 < config.getInt(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION)) {
             throw new ConfigException("Must set " + ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION + " to at most 5" +
@@ -546,13 +546,15 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         return config.getInt(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION);
     }
 
+    //配置幂等性
     private static short configureAcks(ProducerConfig config, Logger log) {
         boolean userConfiguredAcks = config.originals().containsKey(ProducerConfig.ACKS_CONFIG);
         short acks = Short.parseShort(config.getString(ProducerConfig.ACKS_CONFIG));
-
+        // 如果开启了幂等性，但是用户没有指定ack，则返回 -1。-1表示包括leader和follower分区都要确认
         if (config.idempotenceEnabled()) {
             if (!userConfiguredAcks)
                 log.info("Overriding the default {} to all since idempotence is enabled.", ProducerConfig.ACKS_CONFIG);
+            // 如果开启了幂等性，但是用户指定的ack不为 -1，则会抛出异常
             else if (acks != -1)
                 throw new ConfigException("Must set " + ProducerConfig.ACKS_CONFIG + " to all in order to use the idempotent " +
                         "producer. Otherwise we cannot guarantee idempotence.");
@@ -585,6 +587,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
      * @throws TimeoutException if the time taken for initialize the transaction has surpassed <code>max.block.ms</code>.
      * @throws InterruptException if the thread is interrupted while blocked
      */
+    @Override
     public void initTransactions() {
         throwIfNoTransactionManager();
         throwIfProducerClosed();
@@ -858,6 +861,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
     @Override
     public Future<RecordMetadata> send(ProducerRecord<K, V> record, Callback callback) {
         // intercept the record, which can be potentially modified; this method does not throw exceptions
+        // 执行拦截器
         ProducerRecord<K, V> interceptedRecord = this.interceptors.onSend(record);
         return doSend(interceptedRecord, callback);
     }
@@ -911,8 +915,8 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                         " to class " + producerConfig.getClass(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG).getName() +
                         " specified in value.serializer", cce);
             }
-            //如果Key为null，则按照一种轮询的方式来计算分区分配
-            //如果Key不为null则使用称之为murmur的Hash算法（非加密型Hash函数，具备高运算性能及低碰撞率）来计算分区分配。
+            // 如果key 不为空，会计算 key 的 hash 值，再和该主题的分区总数取余得到分区号；
+            // 如果 key 为空，客户端会生成递增的随机整数，再和该主题的分区总数区域得到分区号。
             int partition = partition(record, serializedKey, serializedValue, cluster);
             tp = new TopicPartition(record.topic(), partition);
 
@@ -933,7 +937,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             if (transactionManager != null && transactionManager.isTransactional()) {
                 transactionManager.failIfNotReadyForSend();
             }
-            //向 accumulator 中追加数据
+            //向 accumulator加入消息：（实际上就是加入一个topic和partition确定唯一的双端队列中）:
             RecordAccumulator.RecordAppendResult result = accumulator.append(tp, timestamp, serializedKey,
                     serializedValue, headers, interceptCallback, remainingWaitMs, true, nowMs);
             //中止新批处理
@@ -1006,6 +1010,19 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
      * @throws TimeoutException if metadata could not be refreshed within {@code max.block.ms}
      * @throws KafkaException for all Kafka-related exceptions, including the case where this method is called after producer close
      */
+    /**
+     * 如果根据指定的主题和分区能在缓存中查找到，则直接返回元数据，结束流程。
+     * 否则，设置需要更新元数据的标记 needUpdate=true，并获取当前的 version。
+     * 唤醒 Sender 线程，当 Sender 线程判断 needUpdate=true 时，发送获取元数据的请求到 broker，获取到后更新 needUpdate=true，version+1。
+     * 当前线程判断，如果 version 变大，说明元数据已更新，则跳出循环，拉取新的元数据，判断是否匹配到主题和分区，如果没有匹配到，返回第2步。
+     * 如果 version 没变大，说明元数据还没更新，则调用 wait(long timeout) 方法，等待 timeout 时间后，
+     * @param topic
+     * @param partition
+     * @param nowMs
+     * @param maxWaitMs
+     * @return
+     * @throws InterruptedException
+     */
     private ClusterAndWaitTime waitOnMetadata(String topic, Integer partition, long nowMs, long maxWaitMs) throws InterruptedException {
         // add topic to metadata topic list if it is not there already and reset expiry
         Cluster cluster = metadata.fetch();
@@ -1016,16 +1033,13 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         metadata.add(topic, nowMs);
 
         Integer partitionsCount = cluster.partitionCountForTopic(topic);
-        // Return cached metadata if we have it, and if the record's partition is either undefined
-        // or within the known partition range
+        //如果根据指定的主题和分区能在缓存中查找到，则直接返回元数据，结束流程。
         if (partitionsCount != null && (partition == null || partition < partitionsCount))
             return new ClusterAndWaitTime(cluster, 0);
 
         long remainingWaitMs = maxWaitMs;
         long elapsed = 0;
-        // Issue metadata requests until we have metadata for the topic and the requested partition,
-        // or until maxWaitTimeMs is exceeded. This is necessary in case the metadata
-        // is stale and the number of partitions for this topic has increased in the meantime.
+        // 否则：唤醒 Sender 线程，并获取最新的元数据并进行返回
         do {
             if (partition != null) {
                 log.trace("Requesting metadata update for partition {} of topic {}.", partition, topic);

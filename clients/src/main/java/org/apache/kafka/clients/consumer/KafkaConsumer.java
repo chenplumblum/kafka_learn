@@ -571,9 +571,14 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
     private Logger log;
     private final String clientId;
     private final Optional<String> groupId;
+    //处理重平衡
     private final ConsumerCoordinator coordinator;
+    // key序列化
     private final Deserializer<K> keyDeserializer;
+    // value序列化
     private final Deserializer<V> valueDeserializer;
+    // 拉取服务器metadata
+    // 拉取服务器metadata
     private final Fetcher<K, V> fetcher;
     private final ConsumerInterceptors<K, V> interceptors;
 
@@ -1220,8 +1225,11 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * @throws KafkaException if the rebalance callback throws exception
      */
     private ConsumerRecords<K, V> poll(final Timer timer, final boolean includeMetadataInTimeout) {
+        // 获取轻量级锁，并判断消费者是否关闭
+        //多线程检查
         acquireAndEnsureOpen();
         try {
+            //超时检查
             this.kafkaConsumerMetrics.recordPollStart(timer.currentTimeMs());
 
             if (this.subscriptions.hasNoSubscriptionOrUserAssignment()) {
@@ -1229,6 +1237,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
             }
 
             // poll for new data until the timeout expires
+            //轮询消息知道超时
             do {
                 client.maybeTriggerWakeup();
 
@@ -1287,6 +1296,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                 Math.min(coordinator.timeToNextPoll(timer.currentTimeMs()), timer.remainingMs());
 
         // if data is available already, return it immediately
+        //如果消息已经存在，则直接返回
         final Map<TopicPartition, List<ConsumerRecord<K, V>>> records = fetcher.fetchedRecords();
         if (!records.isEmpty()) {
             return records;

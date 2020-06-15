@@ -247,6 +247,10 @@ public class Sender implements Runnable {
         // okay we stopped accepting requests but there may still be
         // requests in the transaction manager, accumulator or waiting for acknowledgment,
         // wait until these are completed.
+        /**
+         *如果没有强制关闭，accumulator中还有剩余消息，还有等待未响应的消息
+         * 继续执行：继续调用run方法发送剩余消息
+         */
         while (!forceClose && ((this.accumulator.hasUndrained() || this.client.inFlightRequestCount() > 0) || hasPendingTransactionalRequests())) {
             try {
                 runOnce();
@@ -256,6 +260,10 @@ public class Sender implements Runnable {
         }
 
         // Abort the transaction if any commit or abort didn't go through the transaction manager's queue
+        /**
+         * Sender线程强制关闭，所有的未发消息全部失败，并唤醒furture。
+         *
+         */
         while (!forceClose && transactionManager != null && transactionManager.hasOngoingTransaction()) {
             if (!transactionManager.isCompleting()) {
                 log.info("Aborting incomplete transaction due to shutdown");
@@ -292,6 +300,7 @@ public class Sender implements Runnable {
      *
      */
     void runOnce() {
+        //事务消息处理
         if (transactionManager != null) {
             try {
                 transactionManager.maybeResolveSequences();
@@ -320,16 +329,25 @@ public class Sender implements Runnable {
         }
 
         long currentTimeMs = time.milliseconds();
+        //发送消息
         long pollTimeout = sendProducerData(currentTimeMs);
+        //
         client.poll(pollTimeout, currentTimeMs);
     }
 
+    /**
+     * 发送消息
+     * @param now
+     * @return
+     */
     private long sendProducerData(long now) {
+        // 获得Kafka集群数据
         Cluster cluster = metadata.fetch();
-        // get the list of partitions with data ready to send
+        //获取准备发送数据的分区列表
         RecordAccumulator.ReadyCheckResult result = this.accumulator.ready(cluster, now);
 
         // if there are any partitions whose leaders are not known yet, force metadata update
+        //处理未知topic消息
         if (!result.unknownLeaderTopics.isEmpty()) {
             // The set of topics with unknown leader contains topics with leader election pending as well as
             // topics which may have expired. Add the topic again to metadata to ensure it is included
@@ -343,6 +361,7 @@ public class Sender implements Runnable {
         }
 
         // remove any nodes we aren't ready to send to
+        //移出没有ready的nodes
         Iterator<Node> iter = result.readyNodes.iterator();
         long notReadyTimeout = Long.MAX_VALUE;
         while (iter.hasNext()) {
@@ -353,13 +372,16 @@ public class Sender implements Runnable {
             }
         }
 
-        // create produce requests
+        // create produce requests:创建发送请求（）
         Map<Integer, List<ProducerBatch>> batches = this.accumulator.drain(cluster, result.readyNodes, this.maxRequestSize, now);
+        //添加到发送列表
         addToInflightBatches(batches);
+        //顺序发送
         if (guaranteeMessageOrder) {
             // Mute all the partitions drained
             for (List<ProducerBatch> batchList : batches.values()) {
                 for (ProducerBatch batch : batchList)
+                    //进行分区隔离
                     this.accumulator.mutePartition(batch.topicPartition);
             }
         }
@@ -372,8 +394,10 @@ public class Sender implements Runnable {
         // Reset the producer id if an expired batch has previously been sent to the broker. Also update the metrics
         // for expired batches. see the documentation of @TransactionState.resetIdempotentProducerId to understand why
         // we need to reset the producer id here.
+
         if (!expiredBatches.isEmpty())
             log.trace("Expired {} batches in accumulator", expiredBatches.size());
+        // 将由于元数据不可用而导致发送超时的 RecordBatch 移除
         for (ProducerBatch expiredBatch : expiredBatches) {
             String errorMessage = "Expiring " + expiredBatch.recordCount + " record(s) for " + expiredBatch.topicPartition
                 + ":" + (now - expiredBatch.createdMs) + " ms has passed since batch creation";
@@ -383,6 +407,7 @@ public class Sender implements Runnable {
                 transactionManager.markSequenceUnresolved(expiredBatch);
             }
         }
+        //更新发送请求魔法值
         sensors.updateProduceRequestMetrics(batches);
 
         // If we have any nodes that are ready to send + have sendable data, poll with 0 timeout so this can immediately
@@ -401,6 +426,7 @@ public class Sender implements Runnable {
             // otherwise the select time will be the time difference between now and the metadata expiry time;
             pollTimeout = 0;
         }
+        // 发送 RecordBatch
         sendProduceRequests(batches, now);
         return pollTimeout;
     }

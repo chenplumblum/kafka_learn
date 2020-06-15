@@ -87,6 +87,8 @@ public interface Producer<K, V> extends Closeable {
 
     /**
      * See {@link KafkaProducer#partitionsFor(String)}
+     * product会维护一个MetaData(保存kafka集群元数据),并定时更新，
+     * 获取MetaData中获取指定topic中的分区信息
      */
     List<PartitionInfo> partitionsFor(String topic);
 

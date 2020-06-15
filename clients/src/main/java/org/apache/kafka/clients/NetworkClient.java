@@ -281,6 +281,7 @@ public class NetworkClient implements KafkaClient {
      * @return True if we are ready to send to the given node
      */
     @Override
+    //检验消费者与此节点的连接
     public boolean ready(Node node, long now) {
         if (node.isEmpty())
             throw new IllegalArgumentException("Cannot connect to empty node " + node);

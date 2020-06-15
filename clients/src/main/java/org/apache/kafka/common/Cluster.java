@@ -32,19 +32,25 @@ import java.util.Set;
 /**
  * An immutable representation of a subset of the nodes, topics, and partitions in the Kafka cluster.
  */
+
+/**
+ * broker.id 与 node 的对应关系；
+ * topic 与 partition （PartitionInfo）的对应关系；
+ * node 与 partition （PartitionInfo）的对应关系。
+ */
 public final class Cluster {
 
-    private final boolean isBootstrapConfigured;
-    private final List<Node> nodes;
-    private final Set<String> unauthorizedTopics;
-    private final Set<String> invalidTopics;
-    private final Set<String> internalTopics;
+    private final boolean isBootstrapConfigured;// 从命名直接就看出了各个变量的用途
+    private final List<Node> nodes;// node 列表
+    private final Set<String> unauthorizedTopics;// 未认证的 topic 列表
+    private final Set<String> invalidTopics;//无效的 topic 列表
+    private final Set<String> internalTopics;// 内置的 topic 列表
     private final Node controller;
     private final Map<TopicPartition, PartitionInfo> partitionsByTopicPartition;
-    private final Map<String, List<PartitionInfo>> partitionsByTopic;
-    private final Map<String, List<PartitionInfo>> availablePartitionsByTopic;
-    private final Map<Integer, List<PartitionInfo>> partitionsByNode;
-    private final Map<Integer, Node> nodesById;
+    private final Map<String, List<PartitionInfo>> partitionsByTopic;// topic 与 partition 的对应关系
+    private final Map<String, List<PartitionInfo>> availablePartitionsByTopic;// 可用（leader 不为 null）topic 与 partition 的对应关系
+    private final Map<Integer, List<PartitionInfo>> partitionsByNode;// node 与 partition 的对应关系
+    private final Map<Integer, Node> nodesById;// node 与 id 的对应关系
     private final ClusterResource clusterResource;
 
     /**

@@ -57,7 +57,9 @@ public class ConsumerNetworkClient implements Closeable {
     // the mutable state of this class is protected by the object's monitor (excluding the wakeup
     // flag and the request completion queue below).
     private final Logger log;
+    // networkClient对象
     private final KafkaClient client;
+    //未发送的请求
     private final UnsentRequests unsent = new UnsentRequests();
     private final Metadata metadata;
     private final Time time;
@@ -238,6 +240,8 @@ public class ConsumerNetworkClient implements Closeable {
      * @param timer Timer bounding how long this method can block
      * @param pollCondition Nullable blocking condition
      * @param disableWakeup If TRUE disable triggering wake-ups
+     * 重点：
+     *
      */
     public void poll(Timer timer, PollCondition pollCondition, boolean disableWakeup) {
         // there may be handlers which need to be invoked if we woke up the previous call to poll
@@ -249,6 +253,7 @@ public class ConsumerNetworkClient implements Closeable {
             handlePendingDisconnects();
 
             // send all the requests we can send now
+            //循环处理unsent的缓存请求
             long pollDelayMs = trySend(timer.currentTimeMs());
 
             // check whether the poll is still needed by the caller. Note that if the expected completion
@@ -256,6 +261,7 @@ public class ConsumerNetworkClient implements Closeable {
             // handler), the client will be woken up.
             if (pendingCompletion.isEmpty() && (pollCondition == null || pollCondition.shouldBlock())) {
                 // if there are no requests in flight, do not block longer than the retry backoff
+                //计算超时时间
                 long pollTimeout = Math.min(timer.remainingMs(), pollDelayMs);
                 if (client.inFlightRequestCount() == 0)
                     pollTimeout = Math.min(pollTimeout, retryBackoffMs);
@@ -268,6 +274,7 @@ public class ConsumerNetworkClient implements Closeable {
             // handle any disconnects by failing the active requests. note that disconnects must
             // be checked immediately following poll since any subsequent call to client.ready()
             // will reset the disconnect status
+            //根据连接状态处理unsent请求
             checkDisconnects(timer.currentTimeMs());
             if (!disableWakeup) {
                 // trigger wakeups after checking for disconnects so that the callbacks will be ready
@@ -275,6 +282,7 @@ public class ConsumerNetworkClient implements Closeable {
                 maybeTriggerWakeup();
             }
             // throw InterruptException if this thread is interrupted
+            //处理线程中断
             maybeThrowInterruptException();
 
             // try again to send requests since buffer space may have been
@@ -282,6 +290,7 @@ public class ConsumerNetworkClient implements Closeable {
             trySend(timer.currentTimeMs());
 
             // fail requests that couldn't be sent if they have expired
+            //处理unsent中超时请求
             failExpiredRequests(timer.currentTimeMs());
 
             // clean unsent requests collection to keep the map from growing indefinitely
@@ -481,6 +490,7 @@ public class ConsumerNetworkClient implements Closeable {
     }
 
     // Visible for testing
+    //循环处理unsent中的缓存请求
     long trySend(long now) {
         long pollDelayMs = maxPollTimeoutMs;
 

@@ -48,6 +48,7 @@ public interface Consumer<K, V> extends Closeable {
 
     /**
      * @see KafkaConsumer#subscribe(Collection)
+     * 执行消费的topic
      */
     void subscribe(Collection<String> topics);
 
