@@ -578,12 +578,12 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
     // value序列化
     private final Deserializer<V> valueDeserializer;
     // 拉取服务器metadata
-    // 拉取服务器metadata
     private final Fetcher<K, V> fetcher;
     private final ConsumerInterceptors<K, V> interceptors;
 
     private final Time time;
     private final ConsumerNetworkClient client;
+    // 记录每一个TopicPartition的消费情况，主要是为了快速查找offset
     private final SubscriptionState subscriptions;
     private final ConsumerMetadata metadata;
     private final long retryBackoffMs;
@@ -594,8 +594,10 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
 
     // currentThread holds the threadId of the current thread accessing KafkaConsumer
     // and is used to prevent multi-threaded access
+    //包含获取锁的线程的线程id
     private final AtomicLong currentThread = new AtomicLong(NO_CURRENT_THREAD);
     // refcount is used to allow reentrant access by the thread who has acquired currentThread
+    // 用于标记获取currentThread的线程进行访问的次数
     private final AtomicInteger refcount = new AtomicInteger(0);
 
     // to keep from repeatedly scanning subscriptions in poll(), cache the result during metadata updates
@@ -1225,13 +1227,16 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * @throws KafkaException if the rebalance callback throws exception
      */
     private ConsumerRecords<K, V> poll(final Timer timer, final boolean includeMetadataInTimeout) {
-        // 获取轻量级锁，并判断消费者是否关闭
-        //多线程检查
+        // 检查是否可以拉取消息：
+        /**
+         * 1. 是否有其他线程再执行，如果有，则抛出异常，因为 - KafkaConsumer 是线程不安全的，同一时间只能一个线程执行。
+         * 2. 没有被关闭。
+         */
         acquireAndEnsureOpen();
         try {
-            //超时检查
+            //初始化基础变量
             this.kafkaConsumerMetrics.recordPollStart(timer.currentTimeMs());
-
+            // 判断消费者是否订阅主题
             if (this.subscriptions.hasNoSubscriptionOrUserAssignment()) {
                 throw new IllegalStateException("Consumer is not subscribed to any topics or assigned any partitions");
             }
@@ -1239,21 +1244,36 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
             // poll for new data until the timeout expires
             //轮询消息知道超时
             do {
+                //唤醒消费客户端：判断消费者客户端是否唤醒
+                //避免在禁止禁用wakeup时，有请求想唤醒时则抛出异常
                 client.maybeTriggerWakeup();
-
+                // 传入的参数，是否需要更新偏移量：默认true
                 if (includeMetadataInTimeout) {
                     // try to update assignment metadata BUT do not need to block on the timer,
                     // since even if we are 1) in the middle of a rebalance or 2) have partitions
                     // with unknown starting positions we may still want to return some data
                     // as long as there are some partitions fetchable; NOTE we always use a timer with 0ms
                     // to never block on completing the rebalance procedure if there's any
+                    // 对协调器事件进行轮询。这确保协调器是已知的，并且使用者已经加入了组(如果它正在使用组管理)。如果启用了定期偏移量提交，这也将处理它们。如果超时返回false
+                    // 将获取位置设置为提交位置(如果有)，或者使用用户配置的偏移重置策略重置它。
+                    //重点方法：消费者获取metaData信息：包含重平衡，
+                    /**
+                     * 如有必要，先向 broker 端拉取最新的订阅信息(包含消费组内的在线的消费客户端)。
+                     * 执行已完成(异步提交)的 offset 提交请求的回调函数。
+                     * 维护与 broker 端的心跳请求，确保不会被“踢出”消费组。
+                     * 更新元信息。
+                     * 如果是自动提交消费偏移量，则自动提交偏移量。
+                     * 更新各个分区下次待拉取的偏移量。
+                     */
                     updateAssignmentMetadataIfNeeded(time.timer(0L));
                 } else {
+                    // 对协调器事件进行轮询。这确保协调器是已知的，并且使用者已经加入了组(如果它正在使用组管理)。如果启用了定期偏移量提交，这也将处理它们。这里传入的超时时长非常大，会一直等待直至完成对协调器时间的轮询
+                    // 将获取位置设置为提交位置(如果有)，或者使用用户配置的偏移重置策略重置它。
                     while (!updateAssignmentMetadataIfNeeded(time.timer(Long.MAX_VALUE))) {
                         log.warn("Still waiting for metadata");
                     }
                 }
-
+                // 抓取到数据，下面详细介绍 pollForFetches 方法
                 final Map<TopicPartition, List<ConsumerRecord<K, V>>> records = pollForFetches(timer);
                 if (!records.isEmpty()) {
                     // before returning the fetched records, we can send off the next round of fetches
@@ -1262,12 +1282,18 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
                     //
                     // NOTE: since the consumed position has already been updated, we must not allow
                     // wakeups or any other errors to be triggered prior to returning the fetched records.
+                    /**
+                     * 如果拉取到的消息集合不为空，再返回该批消息之前，如果还有挤压的拉取请求，可以继续发送拉取请求
+                     * 但此时会禁用warkup，主要的目的是用户在处理消息时，KafkaConsumer 还可以继续向broker 拉取消息。
+                     */
                     if (fetcher.sendFetches() > 0 || client.hasPendingRequests()) {
+                        // 在返回获取的数据记录之前，我们可以发送下一轮获取请求，并避免在用户处理获取的记录时阻塞等待它们的响应以启用管道。
                         client.transmitSends();
                     }
-
+                    // 返回消费的数据记录，不过需要先由拦截器加工一下
                     return this.interceptors.onConsume(new ConsumerRecords<>(records));
                 }
+                // 只要没有超时，就一直循环消费数据
             } while (timer.notExpired());
 
             return ConsumerRecords.empty();
@@ -1292,6 +1318,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      * @throws KafkaException if the rebalance callback throws exception
      */
     private Map<TopicPartition, List<ConsumerRecord<K, V>>> pollForFetches(Timer timer) {
+        // 计算拉取过期时间
         long pollTimeout = coordinator == null ? timer.remainingMs() :
                 Math.min(coordinator.timeToNextPoll(timer.currentTimeMs()), timer.remainingMs());
 
@@ -1303,6 +1330,7 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
         }
 
         // send any new fetches (won't resend pending fetches)
+        // 组装发送请求，并将存储在待发送请求列表中
         fetcher.sendFetches();
 
         // We do not want to be stuck blocking in poll if we are missing some positions
@@ -1310,18 +1338,20 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
 
         // NOTE: the use of cachedSubscriptionHashAllFetchPositions means we MUST call
         // updateAssignmentMetadataIfNeeded before this method.
+        //如果已缓存的分区信息中存在某些分区缺少偏移量，如果拉取的超时时间大于失败重试需要阻塞的时间，则更新此次拉取的超时时间为失败重试需要的间隔时间，主要的目的是不希望在 poll 过程中被阻塞
         if (!cachedSubscriptionHashAllFetchPositions && pollTimeout > retryBackoffMs) {
             pollTimeout = retryBackoffMs;
         }
-
+        // 通过调用NetworkClient 的 poll 方法发起消息拉取操作
         Timer pollTimer = time.timer(pollTimeout);
         client.poll(pollTimer, () -> {
             // since a fetch might be completed by the background thread, we need this poll condition
             // to ensure that we do not block unnecessarily in poll()
             return !fetcher.hasAvailableFetches();
         });
+        // 更新本次拉取的时间
         timer.update(pollTimer.currentTimeMs());
-
+        // 将从 broker 读取到的数据返回
         return fetcher.fetchedRecords();
     }
 
@@ -2382,11 +2412,13 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
      *             defined
      * @return true iff the operation completed without timing out
      */
+    // 更新服务器分区信息和offset位置，
     private boolean updateFetchPositions(final Timer timer) {
         // If any partitions have been truncated due to a leader change, we need to validate the offsets
         fetcher.validateOffsetsIfNeeded();
 
         cachedSubscriptionHashAllFetchPositions = subscriptions.hasAllFetchPositions();
+        // 如果订阅关系中的所有分区都有有效的位移，则返回 true。
         if (cachedSubscriptionHashAllFetchPositions) return true;
 
         // If there are any partitions which do not have a valid position and are not
@@ -2394,15 +2426,18 @@ public class KafkaConsumer<K, V> implements Consumer<K, V> {
         // coordinator lookup if there are partitions which have missing positions, so
         // a consumer with manually assigned partitions can avoid a coordinator dependence
         // by always ensuring that assigned partitions have an initial position.
+        //如果存在任意一个分区没有有效的位移信息，则需要向 broker 发送请求，从broker 获取该消费组，该分区的消费进度。
         if (coordinator != null && !coordinator.refreshCommittedOffsetsIfNeeded(timer)) return false;
 
         // If there are partitions still needing a position and a reset policy is defined,
         // request reset using the default policy. If no reset strategy is defined and there
         // are partitions with a missing position, then we will raise an exception.
+        // 如果经过第二步，订阅关系中还某些分区还是没有获取到有效的偏移量，则使用偏移量重置策略进行重置，如果未配置，则抛出异常。
         subscriptions.resetMissingPositions();
 
         // Finally send an asynchronous request to lookup and update the positions of any
         // partitions which are awaiting reset.
+        // 发送一个异步请求去重置那些正等待重置位置的分区。
         fetcher.resetOffsetsIfNeeded();
 
         return true;

@@ -413,7 +413,7 @@ public class SubscriptionState {
                 .map(PartitionStates.PartitionState::topicPartition)
                 .collect(Collectors.toList());
     }
-
+    // 自动分配partition
     public synchronized boolean hasAutoAssignedPartitions() {
         return this.subscriptionType == SubscriptionType.AUTO_TOPICS || this.subscriptionType == SubscriptionType.AUTO_PATTERN;
     }

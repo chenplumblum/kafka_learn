@@ -66,6 +66,7 @@ public class ConsumerNetworkClient implements Closeable {
     private final long retryBackoffMs;
     private final int maxPollTimeoutMs;
     private final int requestTimeoutMs;
+
     private final AtomicBoolean wakeupDisabled = new AtomicBoolean();
 
     // We do not need high throughput, so use a fair lock to try to avoid starvation
@@ -259,6 +260,7 @@ public class ConsumerNetworkClient implements Closeable {
             // check whether the poll is still needed by the caller. Note that if the expected completion
             // condition becomes satisfied after the call to shouldBlock() (because of a fired completion
             // handler), the client will be woken up.
+            //拉取消息
             if (pendingCompletion.isEmpty() && (pollCondition == null || pollCondition.shouldBlock())) {
                 // if there are no requests in flight, do not block longer than the retry backoff
                 //计算超时时间

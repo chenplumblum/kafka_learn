@@ -90,23 +90,29 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
     private final List<ConsumerPartitionAssignor> assignors;
     private final ConsumerMetadata metadata;
     private final ConsumerCoordinatorMetrics sensors;
+    // 维护消费者的消费状态
     private final SubscriptionState subscriptions;
+    // offset回滚标识位
     private final OffsetCommitCallback defaultOffsetCommitCallback;
     private final boolean autoCommitEnabled;
     private final int autoCommitIntervalMs;
+    //poll方法返回给用户数据钱进行拦截或者修改
     private final ConsumerInterceptors<?, ?> interceptors;
     private final AtomicInteger pendingAsyncCommits;
 
-    // this collection must be thread-safe because it is modified from the response handler
-    // of offset commit requests, which may be invoked from the heartbeat thread
+    // this collection must be thread-safe because it is modified from the response handler of offset commit requests, which may be invoked from the heartbeat thread
+    // 提交了commit的offset的对象
     private final ConcurrentLinkedQueue<OffsetCommitCompletion> completedOffsetCommits;
 
     private boolean isLeader = false;
     private Set<String> joinedSubscription;
+    //元数据快照
     private MetadataSnapshot metadataSnapshot;
+    // 任务分配快照
     private MetadataSnapshot assignmentSnapshot;
     private Timer nextAutoCommitTimer;
     private AtomicBoolean asyncCommitFenced;
+    //消费者组元数据
     private ConsumerGroupMetadata groupMetadata;
 
     // hold onto request&future for committed offset requests to enable async calls.
@@ -448,8 +454,9 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
      * @return true iff the operation succeeded
      */
     public boolean poll(Timer timer) {
+        //更新元数据(使用version保证最新)
         maybeUpdateSubscriptionMetadata();
-
+        //注入offset提交的回调函数
         invokeCompletedOffsetCommitCallbacks();
 
         if (subscriptions.hasAutoAssignedPartitions()) {
@@ -457,17 +464,27 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
                 throw new IllegalStateException("User configured " + ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG +
                     " to empty while trying to subscribe for group protocol to auto assign partitions");
             }
-            // Always update the heartbeat last poll time so that the heartbeat thread does not leave the
-            // group proactively due to application inactivity even if (say) the coordinator cannot be found.
+            // Always update the heartbeat last poll time so that the heartbeat thread does not leave the group proactively due to application inactivity even if (say) the coordinator cannot be found.
+            //更新发送心跳相关的时间，例如heartbeatTimer、sessionTimer、pollTimer 分别代表发送最新发送心跳的时间、会话最新活跃时间、最新拉取消息。
             pollHeartbeat(timer.currentTimeMs());
+            //如果不存在协调器或协调器已断开连接，则返回 false，结束本次拉取。如果协调器就绪，则继续往下走。
             if (coordinatorUnknown() && !ensureCoordinatorReady(timer)) {
                 return false;
             }
-
+            //判断初始化元数据和重平衡发送竞争
+            /**
+             * 判断是否需要触发重平衡，即消费组内的所有消费者重新分配topic中的分区信息，例如元数据发送变化，判断是否需要重新重平衡的关键点如下：
+             *
+             * 如果队列负载是通过用户指定的，则返回 false，表示无需重平衡。
+             * 如果队列是自动负载，topic 队列元数据发生了变化，则需要重平衡。
+             * 如果队列是自动负载，订阅关系发生了变化，则需要重平衡。
+             * 如果需要重重平衡，则同步更新元数据，此过程会阻塞。详细的重平衡将单独重点介绍，这里暂时不深入展开。
+             */
             if (rejoinNeededOrPending()) {
                 // due to a race condition between the initial metadata fetch and the initial rebalance,
                 // we need to ensure that the metadata is fresh before joining initially. This ensures
                 // that we have matched the pattern against the cluster's topics at least once before joining.
+                // 是否自动获取partition
                 if (subscriptions.hasPatternSubscription()) {
                     // For consumer group that uses pattern-based subscription, after a topic is created,
                     // any consumer that discovers the topic after metadata refresh can trigger rebalance
@@ -476,6 +493,11 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
                     // reduce the number of rebalances caused by single topic creation by asking consumer to
                     // refresh metadata before re-joining the group as long as the refresh backoff time has
                     // passed.
+                    /**
+                     * 对于手动分配的分区，如果没有就绪的节点，请等待元数据.If所有节点的连接都失败，尝试发送fetch请求时触发的唤醒会导致轮询立即返回，从而导致轮询的紧密循环。如果没有唤醒，没有通道的poll（）将在超时时阻塞，从而延迟-连接.awaitMetadataUpdate（）使用配置的退避启动新连接，并避免繁忙循环。当已使用组管理，此方案的元数据等待已作为
+                     *
+                     * 协调器未知，因此不需要此检查
+                     */
                     if (this.metadata.timeToAllowUpdate(timer.currentTimeMs()) == 0) {
                         this.metadata.requestUpdate();
                     }
@@ -499,11 +521,17 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
             // awaitMetadataUpdate() initiates new connections with configured backoff and avoids the busy loop.
             // When group management is used, metadata wait is already performed for this scenario as
             // coordinator is unknown, hence this check is not required.
+            /**
+             * 对于手动分配的分区，如果没有就绪的节点，请等待元数据.If所有节点的连接都失败，尝试发送fetch请求时触发的唤醒会导致轮询立即返回，从而导致轮询的紧密循环。如果没有唤醒，没有通道的poll（）将在超时时阻塞，从而延迟-连接.awaitMetadataUpdate（）使用配置的退避启动新连接，并避免繁忙循环。当已使用组管理，此方案的元数据等待已作为
+             *
+             * 协调器未知，因此不需要此检查
+             */
+            //如果需要更新元数据，并且还没有分区准备好，则同步阻塞等待元数据更新完毕。
             if (metadata.updateRequested() && !client.hasReadyNodes(timer.currentTimeMs())) {
                 client.awaitMetadataUpdate(timer);
             }
         }
-
+        // 如果开启了自动提交消费进度，并且已到下一次提交时间，则提交。Kafka 消费者可以通过设置属性 enable.auto.commit 来开启自动提交，该参数默认为 true，则默认会每隔 5s 提交一次消费进度，提交间隔可以通过参数 auto.commit.interval.ms 设置
         maybeAutoCommitOffsetsAsync(timer.currentTimeMs());
         return true;
     }
@@ -875,6 +903,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
 
     // visible for testing
     void invokeCompletedOffsetCommitCallbacks() {
+        //异步提交隔离
         if (asyncCommitFenced.get()) {
             throw new FencedInstanceIdException("Get fenced exception for group.instance.id "
                 + rebalanceConfig.groupInstanceId.orElse("unset_instance_id")
