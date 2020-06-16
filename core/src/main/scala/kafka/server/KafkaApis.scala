@@ -119,6 +119,7 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   /**
    * Top-level method that handles all requests and multiplexes to the right api
+   * 所有请求的入口
    */
   def handle(request: RequestChannel.Request): Unit = {
     try {
@@ -465,7 +466,7 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleProduceRequest(request: RequestChannel.Request): Unit = {
     val produceRequest = request.body[ProduceRequest]
     val numBytesAppended = request.header.toStruct.sizeOf + request.sizeOfBodyInBytes
-
+    //进行事务消息处理
     if (produceRequest.hasTransactionalRecords) {
       val isAuthorizedTransactional = produceRequest.transactionalId != null &&
         authorize(request, WRITE, TRANSACTIONAL_ID, produceRequest.transactionalId)

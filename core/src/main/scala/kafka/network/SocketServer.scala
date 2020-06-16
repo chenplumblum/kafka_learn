@@ -522,15 +522,19 @@ private[kafka] class Acceptor(val endPoint: EndPoint,
 
   /**
    * Accept loop that checks for new connection attempts
+   * 接受是否有新的请求连接
    */
   def run(): Unit = {
+//    注册OP_ACCPET事件
     serverChannel.register(nioSelector, SelectionKey.OP_ACCEPT)
+//    标识当前线程已经启动操作
     startupComplete()
     try {
       var currentProcessorIndex = 0
+//      检测线程的运行状态
       while (isRunning) {
         try {
-
+          //等待关注事件就绪
           val ready = nioSelector.select(500)
           if (ready > 0) {
             val keys = nioSelector.selectedKeys()
@@ -539,8 +543,9 @@ private[kafka] class Acceptor(val endPoint: EndPoint,
               try {
                 val key = iter.next
                 iter.remove()
-
+                //调用accept方法处理accept事件
                 if (key.isAcceptable) {
+                  //循环创建acception的accept(key)
                   accept(key).foreach { socketChannel =>
 
                     // Assign the channel to the next processor (using round-robin) to which the
@@ -548,11 +553,16 @@ private[kafka] class Acceptor(val endPoint: EndPoint,
                     // all processors, block until the last one is able to accept a connection.
                     var retriesLeft = synchronized(processors.length)
                     var processor: Processor = null
+
+                    /**
+                     * 使用循环加入到newConnections队列中，如果队列已经满了，则进入阻塞状态
+                     */
                     do {
                       retriesLeft -= 1
                       processor = synchronized {
                         // adjust the index (if necessary) and retrieve the processor atomically for
                         // correct behaviour in case the number of processors is reduced dynamically
+                        //调整索引并自动检索,动态减少处理器数量
                         currentProcessorIndex = currentProcessorIndex % processors.length
                         processors(currentProcessorIndex)
                       }
