@@ -464,9 +464,11 @@ class KafkaApis(val requestChannel: RequestChannel,
    * Handle a produce request
    */
   def handleProduceRequest(request: RequestChannel.Request): Unit = {
+    //将Request转成ProducerRequest
     val produceRequest = request.body[ProduceRequest]
+    //计算整个消息的长度（header + body）
     val numBytesAppended = request.header.toStruct.sizeOf + request.sizeOfBodyInBytes
-    //进行事务消息处理
+    //Request认证，只有通过认证的Request才会被处理
     if (produceRequest.hasTransactionalRecords) {
       val isAuthorizedTransactional = produceRequest.transactionalId != null &&
         authorize(request, WRITE, TRANSACTIONAL_ID, produceRequest.transactionalId)
@@ -480,7 +482,12 @@ class KafkaApis(val requestChannel: RequestChannel,
       sendErrorResponseMaybeThrottle(request, Errors.CLUSTER_AUTHORIZATION_FAILED.exception)
       return
     }
-
+    /**
+     * unauthorizedTopicResponses:没有认证的topic
+     * nonExistingTopicResponses：不存在的topic
+     * invalidRequestResponses：非法的请求
+     * authorizedRequestInfo：通过认证的请求
+     */
     val unauthorizedTopicResponses = mutable.Map[TopicPartition, PartitionResponse]()
     val nonExistingTopicResponses = mutable.Map[TopicPartition, PartitionResponse]()
     val invalidRequestResponses = mutable.Map[TopicPartition, PartitionResponse]()
@@ -504,6 +511,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     // the callback for sending a produce response
+//    定义了一个叫做sendResponseCallback的函数，接收responseStatus: Map[TopicPartition, PartitionResponse]这个参数，用于给Client发送Response
     def sendResponseCallback(responseStatus: Map[TopicPartition, PartitionResponse]): Unit = {
       val mergedResponseStatus = responseStatus ++ unauthorizedTopicResponses ++ nonExistingTopicResponses ++ invalidRequestResponses
       var errorInResponse = false
@@ -560,7 +568,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         sendResponse(request, Some(new ProduceResponse(mergedResponseStatus.asJava, maxThrottleTimeMs)), None)
       }
     }
-
+    //接收processingStats: Map这个参数，用于批量修改传入参数processingStats的内部状态
     def processingStatsCallback(processingStats: FetchResponseStats): Unit = {
       processingStats.foreach { case (tp, info) =>
         updateRecordConversionStats(request, tp, info)
@@ -568,6 +576,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     if (authorizedRequestInfo.isEmpty)
+//      如果通过认证的Request为空，那么直接给Client发送Empty的响应
       sendResponseCallback(Map.empty)
     else {
       val internalTopicsAllowed = request.header.clientId == AdminUtils.AdminClientId
