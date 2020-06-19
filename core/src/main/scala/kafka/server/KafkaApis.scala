@@ -545,6 +545,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
 
       // Send the response immediately. In case of throttling, the channel has already been muted.
+      // 因为设置的 ack=0, 相当于 client 会默认发送成功了,如果 server 在处理的过程出现了错误,那么就会关闭 socket 连接来间接地通知 client,client 会重新刷新 meta,重新建立相应的连接
       if (produceRequest.acks == 0) {
         // no operation needed if producer request.required.acks = 0; however, if there is any error in handling
         // the request, since no response is expected by the producer, the server will close socket server so that
@@ -560,8 +561,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           )
           closeConnection(request, new ProduceResponse(mergedResponseStatus.asJava).errorCounts)
         } else {
-          // Note that although request throttling is exempt for acks == 0, the channel may be throttled due to
-          // bandwidth quota violation.
+          // Note that although request throttling is exempt for acks == 0, the channel may be throttled due to bandwidth quota violation.
           sendNoOpResponseExemptThrottle(request)
         }
       } else {
