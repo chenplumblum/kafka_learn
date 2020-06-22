@@ -500,8 +500,17 @@ class ReplicaManager(val config: KafkaConfig,
                     responseCallback: Map[TopicPartition, PartitionResponse] => Unit,
                     delayedProduceLock: Option[Lock] = None,
                     recordConversionStatsCallback: Map[TopicPartition, RecordConversionStats] => Unit = _ => ()): Unit = {
+    /**
+     * acks 设置有效
+     * 1. ack有效：
+     *    1.1 加入到本地副本
+     *    1.2 处理同步副本：当acks= -1 需要 isr 的 follower 都写入成功的话
+     * 2. ack无效：
+     *    2.1 acks超出可接受范围，仅返回错误，根本不处理请求
+     */
     if (isValidRequiredAcks(requiredAcks)) {
       val sTime = time.milliseconds
+      //重点方法：向本地的副本 log 追加数据
       val localProduceResults = appendToLocalLog(internalTopicsAllowed = internalTopicsAllowed,
         origin, entriesPerPartition, requiredAcks)
       debug("Produce to local log in %d ms".format(time.milliseconds - sTime))
@@ -515,10 +524,11 @@ class ReplicaManager(val config: KafkaConfig,
       }
 
       recordConversionStatsCallback(localProduceResults.map { case (k, v) => k -> v.info.recordConversionStats })
-
+      //处理 ack=-1 的情况：（all）需要等到 isr 的 follower 都写入成功的话,才能返回最后结果
       if (delayedProduceRequestRequired(requiredAcks, entriesPerPartition, localProduceResults)) {
         // create delayed produce operation
         val produceMetadata = ProduceMetadata(requiredAcks, produceStatus)
+        //延迟 produce 请求
         val delayedProduce = new DelayedProduce(timeout, produceMetadata, this, responseCallback, delayedProduceLock)
 
         // create a list of (topic, partition) pairs to use as keys for this delayed produce operation
@@ -527,10 +537,14 @@ class ReplicaManager(val config: KafkaConfig,
         // try to complete the request immediately, otherwise put it into the purgatory
         // this is because while the delayed produce operation is being created, new
         // requests may arrive and hence make this operation completable.
+        /**
+         * 1. 尝试立即完成请求，否则需要将其加入到watch进行观察
+         */
         delayedProducePurgatory.tryCompleteElseWatch(delayedProduce, producerRequestKeys)
 
       } else {
         // we can respond immediately
+        //返回 INVALID_REQUIRED_ACKS 错误
         val produceResponseStatus = produceStatus.map { case (k, status) => k -> status.responseStatus }
         responseCallback(produceResponseStatus)
       }
@@ -784,17 +798,26 @@ class ReplicaManager(val config: KafkaConfig,
       brokerTopicStats.allTopicsStats.totalProduceRequestRate.mark()
 
       // reject appending to internal topics if it is not allowed
+      /**
+       * 1. 如果是内部topic则进行报错
+       * 2. 查找对应的 Partition,并向分区对应的副本写入数据文件
+       */
       if (Topic.isInternal(topicPartition.topic) && !internalTopicsAllowed) {
         (topicPartition, LogAppendResult(
           LogAppendInfo.UnknownLogAppendInfo,
           Some(new InvalidTopicException(s"Cannot append to internal topic ${topicPartition.topic}"))))
       } else {
         try {
+          //获取partition
           val partition = getPartitionOrException(topicPartition, expectLeader = true)
+          //重点方法：如果找到了这个对象,就开始追加日志，并更新message数目
           val info = partition.appendRecordsToLeader(records, origin, requiredAcks)
           val numAppendedMessages = info.numMessages
 
           // update stats for successfully appended bytes and messages as bytesInRate and messageInRate
+          /**
+           * 更新topic状态，更新统计appended和messages的数目
+           */
           brokerTopicStats.topicStats(topicPartition.topic).bytesInRate.mark(records.sizeInBytes)
           brokerTopicStats.allTopicsStats.bytesInRate.mark(records.sizeInBytes)
           brokerTopicStats.topicStats(topicPartition.topic).messagesInRate.mark(numAppendedMessages)

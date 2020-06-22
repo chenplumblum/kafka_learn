@@ -462,6 +462,7 @@ class KafkaApis(val requestChannel: RequestChannel,
 
   /**
    * Handle a produce request
+   * 处理produce的请求：发送的消息为Map<TopicPartion，MemoryRecord> map
    */
   def handleProduceRequest(request: RequestChannel.Request): Unit = {
     //将Request转成ProducerRequest
@@ -470,14 +471,15 @@ class KafkaApis(val requestChannel: RequestChannel,
     val numBytesAppended = request.header.toStruct.sizeOf + request.sizeOfBodyInBytes
     //Request认证，只有通过认证的Request才会被处理
     if (produceRequest.hasTransactionalRecords) {
+      //验证是否有写操作的权限
       val isAuthorizedTransactional = produceRequest.transactionalId != null &&
-        authorize(request, WRITE, TRANSACTIONAL_ID, produceRequest.transactionalId)
+        authorize(request, WRITE, TRANSACTIONAL_ID, produceRequest.transactionalId)//
       if (!isAuthorizedTransactional) {
         sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)
         return
       }
       // Note that authorization to a transactionalId implies ProducerId authorization
-
+      //验证是否幂等性写
     } else if (produceRequest.hasIdempotentRecords && !authorize(request, IDEMPOTENT_WRITE, CLUSTER, CLUSTER_NAME)) {
       sendErrorResponseMaybeThrottle(request, Errors.CLUSTER_AUTHORIZATION_FAILED.exception)
       return
@@ -492,9 +494,10 @@ class KafkaApis(val requestChannel: RequestChannel,
     val nonExistingTopicResponses = mutable.Map[TopicPartition, PartitionResponse]()
     val invalidRequestResponses = mutable.Map[TopicPartition, PartitionResponse]()
     val authorizedRequestInfo = mutable.Map[TopicPartition, MemoryRecords]()
+    //过滤broker剩下只有写权限的topic
     val authorizedTopics = filterAuthorized(request, WRITE, TOPIC,
       produceRequest.partitionRecordsOrFail.asScala.toSeq.map(_._1.topic))
-
+    //验证product的topic是否有权限，并校验消息的是否合法
     for ((topicPartition, memoryRecords) <- produceRequest.partitionRecordsOrFail.asScala) {
       if (!authorizedTopics.contains(topicPartition.topic))
         unauthorizedTopicResponses += topicPartition -> new PartitionResponse(Errors.TOPIC_AUTHORIZATION_FAILED)
@@ -511,11 +514,11 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     // the callback for sending a produce response
-//    定义了一个叫做sendResponseCallback的函数，接收responseStatus: Map[TopicPartition, PartitionResponse]这个参数，用于给Client发送Response
+    //    定义了一个叫做sendResponseCallback的函数，接收responseStatus: Map[TopicPartition, PartitionResponse]这个参数，用于给Client发送Response
     def sendResponseCallback(responseStatus: Map[TopicPartition, PartitionResponse]): Unit = {
       val mergedResponseStatus = responseStatus ++ unauthorizedTopicResponses ++ nonExistingTopicResponses ++ invalidRequestResponses
       var errorInResponse = false
-
+      //对状态进行验证
       mergedResponseStatus.foreach { case (topicPartition, status) =>
         if (status.error != Errors.NONE) {
           errorInResponse = true
@@ -533,7 +536,10 @@ class KafkaApis(val requestChannel: RequestChannel,
       // Record both bandwidth and request quota-specific values and throttle by muting the channel if any of the quotas
       // have been violated. If both quotas have been violated, use the max throttle time between the two quotas. Note
       // that the request quota is not enforced if acks == 0.
+      //用于计算最大失效时间
+      //获取宽带配额特定值，
       val bandwidthThrottleTimeMs = quotas.produce.maybeRecordAndGetThrottleTimeMs(request, numBytesAppended, time.milliseconds)
+      //获取请求配额特定值
       val requestThrottleTimeMs = if (produceRequest.acks == 0) 0 else quotas.request.maybeRecordAndGetThrottleTimeMs(request)
       val maxThrottleTimeMs = Math.max(bandwidthThrottleTimeMs, requestThrottleTimeMs)
       if (maxThrottleTimeMs > 0) {
@@ -545,7 +551,11 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
 
       // Send the response immediately. In case of throttling, the channel has already been muted.
-      // 因为设置的 ack=0, 相当于 client 会默认发送成功了,如果 server 在处理的过程出现了错误,那么就会关闭 socket 连接来间接地通知 client,client 会重新刷新 meta,重新建立相应的连接
+      // 因为设置的 ack=0, 相当于 client 会默认发送成功了,如果 server 在处理的过程出现了错误,那么就会关闭 socket 连接来间接地通知 client,(client 会重新刷新 meta,重新建立相应的连接)
+      /**
+       * 1. ack = 0 : client 会默认发送成功了,如果 server 在处理的过程出现了错误,那么就会关闭 socket 连接来间接地通知 client,(client 会重新刷新 meta,重新建立相应的连接)
+       * 2.
+       */
       if (produceRequest.acks == 0) {
         // no operation needed if producer request.required.acks = 0; however, if there is any error in handling
         // the request, since no response is expected by the producer, the server will close socket server so that
@@ -565,6 +575,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           sendNoOpResponseExemptThrottle(request)
         }
       } else {
+        //重点方法：处理acks=1和acks=2的逻辑的返回实体
         sendResponse(request, Some(new ProduceResponse(mergedResponseStatus.asJava, maxThrottleTimeMs)), None)
       }
     }
@@ -582,6 +593,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       val internalTopicsAllowed = request.header.clientId == AdminUtils.AdminClientId
 
       // call the replica manager to append messages to the replicas
+      //重点方法：追加消息到副本，定义发送消息的回调函数，
       replicaManager.appendRecords(
         timeout = produceRequest.timeout.toLong,
         requiredAcks = produceRequest.acks,

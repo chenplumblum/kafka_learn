@@ -960,6 +960,7 @@ class Partition(val topicPartition: TopicPartition,
           val inSyncSize = inSyncReplicaIds.size
 
           // Avoid writing to leader if there are not enough insync replicas to make it safe
+          //当requiredAcks=-1时，需要保证所有的副本同步，才让leader进行写log
           if (inSyncSize < minIsr && requiredAcks == -1) {
             throw new NotEnoughReplicasException(s"The size of the current ISR $inSyncReplicaIds " +
               s"is insufficient to satisfy the min.isr requirement of $minIsr for partition $topicPartition")
@@ -969,6 +970,7 @@ class Partition(val topicPartition: TopicPartition,
             interBrokerProtocolVersion)
 
           // we may need to increment high watermark since ISR could be down to 1
+          //提高水位
           (info, maybeIncrementLeaderHW(leaderLog))
 
         case None =>

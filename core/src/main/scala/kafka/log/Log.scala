@@ -1039,13 +1039,16 @@ class Log(@volatile var dir: File,
                      assignOffsets: Boolean,
                      leaderEpoch: Int): LogAppendInfo = {
     maybeHandleIOException(s"Error while appending records to $topicPartition in dir ${dir.getParent}") {
+      //返回这批消息的该要信息,并对这批 msg 进行校验
       val appendInfo = analyzeAndValidateRecords(records, origin)
 
       // return if we have no valid messages or if this is a duplicate of the last appended entry
+      //如果没有有效消息或者该消息为最后一条消息，则进行返回
       if (appendInfo.shallowCount == 0)
         return appendInfo
 
       // trim any invalid bytes or partial messages before appending it to the on-disk log
+      //去除无效字符。
       var validRecords = trimInvalidBytes(records, appendInfo)
 
       // they are valid, insert them in the log
@@ -1053,9 +1056,12 @@ class Log(@volatile var dir: File,
         checkIfMemoryMappedBufferClosed()
         if (assignOffsets) {
           // assign offsets to the message set
+          //分配消息的offset位置
           val offset = new LongRef(nextOffsetMetadata.messageOffset)
+          //作为消息集的第一个 offset
           appendInfo.firstOffset = Some(offset.value)
           val now = time.milliseconds
+          //验证消息,并为每条record 设置相应的 offset 和 timestrap
           val validateAndOffsetAssignResult = try {
             LogValidator.validateMessagesAndAssignOffsets(validRecords,
               topicPartition,
@@ -1076,9 +1082,11 @@ class Log(@volatile var dir: File,
             case e: IOException =>
               throw new KafkaException(s"Error validating messages while appending to log $name", e)
           }
+          //返回已经计算好 offset 和 timestrap 的 MemoryRecords
           validRecords = validateAndOffsetAssignResult.validatedRecords
           appendInfo.maxTimestamp = validateAndOffsetAssignResult.maxTimestamp
           appendInfo.offsetOfMaxTimestamp = validateAndOffsetAssignResult.shallowOffsetOfMaxTimestamp
+          //最后一条消息的 offset
           appendInfo.lastOffset = offset.value - 1
           appendInfo.recordConversionStats = validateAndOffsetAssignResult.recordConversionStats
           if (config.messageTimestampType == TimestampType.LOG_APPEND_TIME)
@@ -1086,6 +1094,7 @@ class Log(@volatile var dir: File,
 
           // re-validate message sizes if there's a possibility that they have changed (due to re-compression or message
           // format conversion)
+          //更新 metrics 的记录
           if (validateAndOffsetAssignResult.messageSizeMaybeChanged) {
             for (batch <- validRecords.batches.asScala) {
               if (batch.sizeInBytes > config.maxMessageSize) {
@@ -1100,6 +1109,7 @@ class Log(@volatile var dir: File,
           }
         } else {
           // we are taking the offsets we are given
+          //使用传入的offset位置
           if (!appendInfo.offsetsMonotonic)
             throw new OffsetsOutOfOrderException(s"Out of order offsets found in append to $topicPartition: " +
                                                  records.records.asScala.map(_.offset))
@@ -1124,6 +1134,7 @@ class Log(@volatile var dir: File,
         }
 
         // update the epoch cache with the epoch stamped onto the message by the leader
+        //使用leader的消息状态去更新缓存
         validRecords.batches.asScala.foreach { batch =>
           if (batch.magic >= RecordBatch.MAGIC_VALUE_V2) {
             maybeAssignEpochStartOffset(batch.partitionLeaderEpoch, batch.baseOffset)
@@ -1139,12 +1150,14 @@ class Log(@volatile var dir: File,
         }
 
         // check messages set size may be exceed config.segmentSize
+        //校验消息大小是否超过segmentSize
         if (validRecords.sizeInBytes > config.segmentSize) {
           throw new RecordBatchTooLargeException(s"Message batch size is ${validRecords.sizeInBytes} bytes in append " +
             s"to partition $topicPartition, which exceeds the maximum configured segment size of ${config.segmentSize}.")
         }
 
         // maybe roll the log if this segment is full
+        //如果segment已经满了，进行滚动segment
         val segment = maybeRoll(validRecords.sizeInBytes, appendInfo)
 
         val logOffsetMetadata = LogOffsetMetadata(
@@ -1154,9 +1167,10 @@ class Log(@volatile var dir: File,
 
         // now that we have valid records, offsets assigned, and timestamps updated, we need to
         // validate the idempotent/transactional state of the producers and collect some metadata
+        //验证生产者的幂等/生产者事务状态并收集一些元数据
         val (updatedProducers, completedTxns, maybeDuplicate) = analyzeAndValidateProducerState(
           logOffsetMetadata, validRecords, origin)
-
+        //如果发现已经持久化，则返回appendInfo
         maybeDuplicate.foreach { duplicate =>
           appendInfo.firstOffset = Some(duplicate.firstOffset)
           appendInfo.lastOffset = duplicate.lastOffset
@@ -1164,7 +1178,7 @@ class Log(@volatile var dir: File,
           appendInfo.logStartOffset = logStartOffset
           return appendInfo
         }
-
+        //重点方法：追加消息到segment
         segment.append(largestOffset = appendInfo.lastOffset,
           largestTimestamp = appendInfo.maxTimestamp,
           shallowOffsetOfMaxTimestamp = appendInfo.offsetOfMaxTimestamp,
@@ -1176,15 +1190,18 @@ class Log(@volatile var dir: File,
         // will be cleaned up after the log directory is recovered. Note that the end offset of the
         // ProducerStateManager will not be updated and the last stable offset will not advance
         // if the append to the transaction index fails.
+        //修改最新的 next_offset
         updateLogEndOffset(appendInfo.lastOffset + 1)
 
         // update the producer state
+        //更新producer状态
         for (producerAppendInfo <- updatedProducers.values) {
           producerStateManager.update(producerAppendInfo)
         }
 
         // update the transaction index with the true last stable offset. The last offset visible
         // to consumers using READ_COMMITTED will be limited by this value and the high watermark.
+        //更新事务
         for (completedTxn <- completedTxns) {
           val lastStableOffset = producerStateManager.lastStableOffset(completedTxn)
           segment.updateTxnIndex(completedTxn, lastStableOffset)
@@ -1193,6 +1210,7 @@ class Log(@volatile var dir: File,
 
         // always update the last producer id map offset so that the snapshot reflects the current offset
         // even if there isn't any idempotent data being written
+        //修改最新的快照 next_offset
         producerStateManager.updateMapEndOffset(appendInfo.lastOffset + 1)
 
         // update the first unstable offset (which is used to compute LSO)
@@ -1202,7 +1220,7 @@ class Log(@volatile var dir: File,
           s"first offset: ${appendInfo.firstOffset}, " +
           s"next offset: ${nextOffsetMetadata.messageOffset}, " +
           s"and messages: $validRecords")
-
+        //满足条件的话，刷新磁盘
         if (unflushedMessages >= config.flushInterval)
           flush()
 
