@@ -126,7 +126,9 @@ class KafkaApis(val requestChannel: RequestChannel,
       trace(s"Handling request:${request.requestDesc(true)} from connection ${request.context.connectionId};" +
         s"securityProtocol:${request.context.securityProtocol},principal:${request.context.principal}")
       request.header.apiKey match {
+          //处理消息持久化
         case ApiKeys.PRODUCE => handleProduceRequest(request)
+          //拉取消息：消费者拉取消息，follower同步副本
         case ApiKeys.FETCH => handleFetchRequest(request)
         case ApiKeys.LIST_OFFSETS => handleListOffsetRequest(request)
         case ApiKeys.METADATA => handleTopicMetadataRequest(request)
@@ -638,12 +640,22 @@ class KafkaApis(val requestChannel: RequestChannel,
       new FetchResponse.PartitionData[T](error, FetchResponse.INVALID_HIGHWATERMARK, FetchResponse.INVALID_LAST_STABLE_OFFSET,
         FetchResponse.INVALID_LOG_START_OFFSET, null, MemoryRecords.EMPTY)
     }
-
+    //错误信息缓存topicPartition
     val erroneous = mutable.ArrayBuffer[(TopicPartition, FetchResponse.PartitionData[Records])]()
+    //需要发送的partition数据大小
     val interesting = mutable.ArrayBuffer[(TopicPartition, FetchRequest.PartitionData)]()
+
+    /**
+     * 1. 副本同步消息：
+     * 2. 消费者请求消息：
+     */
     if (fetchRequest.isFromFollower) {
       // The follower must have ClusterAction on ClusterResource in order to fetch partition data.
+      //验证是否有权限
       if (authorize(request, CLUSTER_ACTION, CLUSTER, CLUSTER_NAME)) {
+        /**
+         * 从metaDataCache获取每个分区的数据大小
+         */
         fetchContext.foreachPartition { (topicPartition, data) =>
           if (!metadataCache.contains(topicPartition))
             erroneous += topicPartition -> errorResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
@@ -659,6 +671,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       // Regular Kafka consumers need READ permission on each partition they are fetching.
       val fetchTopics = new mutable.ArrayBuffer[String]
       fetchContext.foreachPartition { (topicPartition, _) => fetchTopics += topicPartition.topic }
+      //过滤剩下可以读取的topic信息
       val authorizedTopics = filterAuthorized(request, READ, TOPIC, fetchTopics)
       fetchContext.foreachPartition { (topicPartition, data) =>
         if (!authorizedTopics.contains(topicPartition.topic))
@@ -825,6 +838,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     // for fetch from consumer, cap fetchMaxBytes to the maximum bytes that could be fetched without being throttled given
     // no bytes were recorded in the recent quota window
     // trying to fetch more bytes would result in a guaranteed throttling potentially blocking consumer progress
+    //计算同步副本最大和最小字节，并进行副本同步
     val maxQuotaWindowBytes = if (fetchRequest.isFromFollower)
       Int.MaxValue
     else
@@ -833,9 +847,11 @@ class KafkaApis(val requestChannel: RequestChannel,
     val fetchMaxBytes = Math.min(Math.min(fetchRequest.maxBytes, config.fetchMaxBytes), maxQuotaWindowBytes)
     val fetchMinBytes = Math.min(fetchRequest.minBytes, fetchMaxBytes)
     if (interesting.isEmpty)
+      //数据为null直接返回
       processResponseCallback(Seq.empty)
     else {
       // call the replica manager to fetch messages from the local replica
+      //重点方法：调用副本管理器以从本地副本获取消息
       replicaManager.fetchMessages(
         fetchRequest.maxWait.toLong,
         fetchRequest.replicaId,

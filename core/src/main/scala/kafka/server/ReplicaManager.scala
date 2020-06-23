@@ -894,6 +894,7 @@ class ReplicaManager(val config: KafkaConfig,
     // Restrict fetching to leader if request is from follower or from a client with older version (no ClientMetadata)
     val fetchOnlyFromLeader = isFromFollower || (isFromConsumer && clientMetadata.isEmpty)
     def readFromLog(): Seq[(TopicPartition, LogReadResult)] = {
+      //重点方法：读取消息
       val result = readFromLocalLog(
         replicaId = replicaId,
         fetchOnlyFromLeader = fetchOnlyFromLeader,
@@ -906,7 +907,7 @@ class ReplicaManager(val config: KafkaConfig,
       if (isFromFollower) updateFollowerFetchState(replicaId, result)
       else result
     }
-
+    //重点方法：读取log的消息
     val logReadResults = readFromLog()
 
     // check if this fetch request can be satisfied right away
@@ -929,6 +930,14 @@ class ReplicaManager(val config: KafkaConfig,
     //                        3) has enough data to respond
     //                        4) some error happens while reading data
     //                        5) any of the requested partitions need HW update
+    /**
+     * 立即返回结果
+     * 1.获取请求时间过期
+     * 2.获取请求不需要任何数据
+     * 3.读取消息大小大于fetchMinBytes
+     * 4.读取数据时发生一些错误
+     * 5.任何请求的分区都需要硬件更新
+     */
     if (timeout <= 0 || fetchInfos.isEmpty || bytesReadable >= fetchMinBytes || errorReadingData || anyPartitionsNeedHwUpdate) {
       val fetchPartitionData = logReadResults.map { case (tp, result) =>
         tp -> FetchPartitionData(result.error, result.highWatermark, result.leaderLogStartOffset, result.info.records,
@@ -937,6 +946,7 @@ class ReplicaManager(val config: KafkaConfig,
       responseCallback(fetchPartitionData)
     } else {
       // construct the fetch results from the read results
+      //构造返回结果
       val fetchPartitionStatus = new mutable.ArrayBuffer[(TopicPartition, FetchPartitionStatus)]
       fetchInfos.foreach { case (topicPartition, partitionData) =>
         logReadResultMap.get(topicPartition).foreach(logReadResult => {
@@ -955,6 +965,7 @@ class ReplicaManager(val config: KafkaConfig,
       // try to complete the request immediately, otherwise put it into the purgatory;
       // this is because while the delayed fetch operation is being created, new requests
       // may arrive and hence make this operation completable.
+      //立即返回或者延时返回（可能有新的请求已经到达）
       delayedFetchPurgatory.tryCompleteElseWatch(delayedFetch, delayedFetchKeys)
     }
   }
@@ -1092,6 +1103,7 @@ class ReplicaManager(val config: KafkaConfig,
       val readResult = read(tp, fetchInfo, limitBytes, minOneMessage)
       val recordBatchSize = readResult.info.records.sizeInBytes
       // Once we read from a non-empty partition, we stop ignoring request and partition level size limits
+      //从非空分区循环读取数据
       if (recordBatchSize > 0)
         minOneMessage = false
       limitBytes = math.max(0, limitBytes - recordBatchSize)
